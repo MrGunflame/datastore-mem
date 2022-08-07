@@ -2,7 +2,16 @@
 name = "datastore-mem"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["MrGunflame <git@robbsrv.de>"]
+description = "A in-memory store"
+documentation = "https://docs.rs/datastore-mem"
+repository = "https://github.com/MrGunflame/datastore-mem"
+license = "MIT OR Apache-2.0"
+publish = true
 
 [dependencies]
+datastore = "0.1.5"
+async-trait = "0.1.57"
+thiserror = "1.0.32"
+parking_lot = "0.12.1"
+
