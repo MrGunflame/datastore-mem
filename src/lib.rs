@@ -20,7 +20,7 @@ impl Store for MemStore {
     type Error = Error;
     type DataStore = Self;
 
-    async fn connect(uri: &str) -> Result<Self, Self::Error> {
+    async fn connect(_uri: &str) -> Result<Self, Self::Error> {
         Ok(Self {
             inner: Arc::new(Inner {
                 map: RwLock::new(HashMap::new()),
@@ -28,7 +28,7 @@ impl Store for MemStore {
         })
     }
 
-    async fn create<T, D>(&self, descriptor: D) -> Result<(), Self::Error>
+    async fn create<T, D>(&self, _descriptor: D) -> Result<(), Self::Error>
     where
         T: StoreData<Self> + Send + Sync + 'static,
         D: DataDescriptor<T, Self> + Send + Sync,
@@ -59,7 +59,21 @@ impl Store for MemStore {
         T: StoreData<Self> + Send + Sync + 'static,
         D: DataDescriptor<T, Self> + Send,
     {
-        unimplemented!()
+        let inner = self.inner.map.read();
+
+        match inner.get(descriptor.ident()) {
+            Some(entries) => {
+                let mut buf = Vec::with_capacity(entries.len());
+
+                for entry in entries {
+                    let mut reader = MemReader::new(entry);
+                    buf.push(T::read(&mut reader)?);
+                }
+
+                Ok(buf)
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     async fn get_one<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Option<T>, Self::Error>
@@ -68,7 +82,21 @@ impl Store for MemStore {
         D: DataDescriptor<T, Self> + Send,
         Q: DataQuery<T, Self> + Send,
     {
-        unimplemented!()
+        let inner = self.inner.map.read();
+
+        match inner.get(descriptor.ident()) {
+            Some(entries) => {
+                let mut writer = MemWriter::new();
+                query.write(&mut writer);
+
+                for entry in entries {
+                    let mut reader = MemReader::new(entry);
+                }
+
+                Ok(Some(x))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn insert<T, D>(&self, descriptor: D, data: T) -> Result<(), Self::Error>
@@ -77,7 +105,9 @@ impl Store for MemStore {
         D: DataDescriptor<T, Self> + Send,
     {
         let mut writer = MemWriter::new();
-        data.write(&mut writer);
+
+        // MemWriter::Error is Infallible
+        let _ = data.write(&mut writer);
 
         self.inner.insert(descriptor.ident(), writer.into_entry());
         Ok(())
@@ -127,6 +157,43 @@ impl Entry {
             }
             None => Err(Error::UnknownKey(key.to_string())),
         }
+    }
+    
+    fn eq(&self, key: &str, kind: DataKind, other: &[u8]) -> Result<bool, Error> {
+        let buf = self.read_field(key, kind)?;
+
+        let res = match kind {
+            DataKind::Bool | DataKind::I8 | DataKind::U8 => {
+                unsafe {
+                    buf.get_unchecked(0) == other.get_unchecked(0)
+                }
+            }
+            DataKind::I16 | DataKind::U16 => {
+                unsafe {
+                    buf.get_unchecked(0..2) == other.get_unchecked(0..2)
+                }
+            }
+            DataKind::I32 | DataKind::U32 | DataKind::F32 => {
+                unsafe {
+                    buf.get_unchecked(0..4) == other.get_unchecked(0..4)
+                }
+            }
+            DataKind::I64 | DataKind::U64 | DataKind::F64 => {
+                unsafe {
+                    buf.get_unchecked(0..8) == other.get_unchecked(0..8)
+                }
+            }
+            DataKind::Bytes | DataKind::String => {
+                let ptr = buf.as_ptr() as *const usize;
+                let len : usize = unsafe { std::ptr::read_unaligned(ptr) };
+
+                let bytes = unsafe { buf.get_unchecked(..std::mem::size_of::<usize>() + len) };
+
+                bytes == other
+            }
+        };
+
+        Ok(res)
     }
 }
 
