@@ -1,3 +1,82 @@
+//! A in-memory datastore Store implementation.
+//!
+//! This crate provides [`MemStore`], datastore [`Store`] implementation which keeps all entries
+//! in memory. It is meant to be fast and efficient, making it a good backing store for in-memory
+//! caches.
+//!
+//! ## Examples
+//!
+//! ```
+//! use datastore::{Store, StoreExt, StoreData};
+//! use datastore_mem::{Error, MemStore};
+//!
+//! #[derive(Debug, PartialEq, StoreData)]
+//! struct Person {
+//!     id: i64,
+//!     name: String,
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Error> {
+//!     let store = MemStore::connect("").await?;
+//!
+//!     let person = Person {
+//!         id: 1,
+//!         name: String::from("Robb"),
+//!     };
+//!
+//!     store.insert(store.descriptor::<Person>(), person.clone()).await?;
+//!
+//!     let persons: Vec<Person> = store.get_all(store.descriptor::<Person>()).await?;
+//!     assert_eq!(persons, [person]);
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Sync methods
+//!
+//! Since [`MemStore`] doesn't need to do any I/O it provides a set of synchronous methods in
+//! addition to the asynchronous [`Store`] implementation.
+//!
+//! ## Examples
+//!
+//! ```
+//! use datastore::{Store, StoreExt, StoreData};
+//! use datastore_mem::{Error, MemStore};
+//!
+//! #[derive(Debug, PartialEq, StoreData)]
+//! struct Person {
+//!     id: i64,
+//!     name: String,
+//! }
+//!
+//! fn main() -> Result<(), Error> {
+//!     let store = MemStore::new();
+//!     
+//!     let person = Person {
+//!         id: 1,
+//!         name: String::from("Robb"),
+//!     };
+//!
+//!     store.insert(store.descriptor::<Person>(), person.clone())?;
+//!
+//!     let persons: Vec<Person> = store.get_all(store.descriptor::<Person>())?;
+//!     assert_eq!(persons, [person]);
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Supported Types
+//!
+//! [`MemStore`] currently supports the following types:
+//! - `bool`
+//! - `i8`, `i16`, `i32`, `i64`
+//! - `u8`, `u32`, `u32`, `u64`
+//! - `f32`, `f64`
+//! - `&str`, `String`
+//! - `&[u8]`, `Vec<u8>`
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod entries;
@@ -19,9 +98,74 @@ use parking_lot::RwLock;
 use schema::Schema;
 use thiserror::Error;
 
+/// A in-memory store.
 #[derive(Clone, Debug)]
 pub struct MemStore {
     inner: Arc<Inner>,
+}
+
+impl MemStore {
+    /// Creates a new, empty `MemStore`.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                map: RwLock::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Deletes all entries of `T` matching the query `Q`.
+    #[inline]
+    pub fn delete<T, D, Q>(&self, descriptor: D, query: Q) -> Result<(), Error>
+    where
+        T: StoreData<Self>,
+        D: DataDescriptor<T, Self>,
+        Q: DataQuery<T, Self>,
+    {
+        self.inner.delete(descriptor, query)
+    }
+
+    /// Returns all entries of `T` matching the query `Q`.
+    #[inline]
+    pub fn get<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Vec<T>, Error>
+    where
+        T: StoreData<Self>,
+        D: DataDescriptor<T, Self>,
+        Q: DataQuery<T, Self>,
+    {
+        self.inner.get(descriptor, query)
+    }
+
+    /// Returns a list of all entries of `T`.
+    #[inline]
+    pub fn get_all<T, D>(&self, descriptor: D) -> Result<Vec<T>, Error>
+    where
+        T: StoreData<Self>,
+        D: DataDescriptor<T, Self>,
+    {
+        self.inner.get_all(descriptor)
+    }
+
+    /// Returns the first inserted entry of `T` matching the query `Q`.
+    #[inline]
+    pub fn get_one<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Option<T>, Error>
+    where
+        T: StoreData<Self>,
+        D: DataDescriptor<T, Self>,
+        Q: DataQuery<T, Self>,
+    {
+        self.inner.get_one(descriptor, query)
+    }
+
+    /// Inserts a new type `T` into the store.
+    #[inline]
+    pub fn insert<T, D>(&self, descriptor: D, data: T) -> Result<(), Error>
+    where
+        T: StoreData<Self>,
+        D: DataDescriptor<T, Self>,
+    {
+        self.inner.insert(descriptor, data)
+    }
 }
 
 #[async_trait]
@@ -37,6 +181,7 @@ impl Store for MemStore {
         })
     }
 
+    #[inline]
     async fn create<T, D>(&self, _descriptor: D) -> Result<(), Self::Error>
     where
         T: StoreData<Self> + Send + Sync + 'static,
@@ -45,6 +190,7 @@ impl Store for MemStore {
         Ok(())
     }
 
+    #[inline]
     async fn delete<T, D, Q>(&self, descriptor: D, query: Q) -> Result<(), Self::Error>
     where
         T: StoreData<Self> + Send + Sync + 'static,
@@ -54,6 +200,7 @@ impl Store for MemStore {
         self.inner.delete(descriptor, query)
     }
 
+    #[inline]
     async fn get<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Vec<T>, Self::Error>
     where
         T: StoreData<Self> + Send + Sync + 'static,
@@ -63,6 +210,7 @@ impl Store for MemStore {
         self.inner.get(descriptor, query)
     }
 
+    #[inline]
     async fn get_all<T, D>(&self, descriptor: D) -> Result<Vec<T>, Self::Error>
     where
         T: StoreData<Self> + Send + Sync + 'static,
@@ -71,6 +219,7 @@ impl Store for MemStore {
         self.inner.get_all(descriptor)
     }
 
+    #[inline]
     async fn get_one<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Option<T>, Self::Error>
     where
         T: StoreData<Self> + Send + Sync + 'static,
@@ -80,6 +229,7 @@ impl Store for MemStore {
         self.inner.get_one(descriptor, query)
     }
 
+    #[inline]
     async fn insert<T, D>(&self, descriptor: D, data: T) -> Result<(), Self::Error>
     where
         T: StoreData<Self> + Send + Sync + 'static,
@@ -402,7 +552,7 @@ impl TypeWriter<MemStore> for MemTypeWriter {
 
 #[cfg(test)]
 mod tests {
-    use datastore::{Store, StoreData};
+    use datastore::StoreData;
 
     use crate::DataKind;
 
@@ -443,14 +593,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_store() {
-        let store = MemStore::connect("").await.unwrap();
+        let store = MemStore::new();
 
         let data = TestData::default();
         let descriptor = <TestData as StoreData<_>>::Descriptor::default();
 
-        store.insert(descriptor, data.clone()).await.unwrap();
+        store.insert(descriptor, data.clone()).unwrap();
 
-        let entries = store.get_all(descriptor).await.unwrap();
+        let entries = store.get_all(descriptor).unwrap();
         assert_eq!(entries, [data.clone()]);
 
         let data2 = TestData {
@@ -458,14 +608,13 @@ mod tests {
             name: "Hello World".into(),
         };
 
-        store.insert(descriptor, data2.clone()).await.unwrap();
+        store.insert(descriptor, data2.clone()).unwrap();
 
-        let entries = store.get_all(descriptor).await.unwrap();
+        let entries = store.get_all(descriptor).unwrap();
         assert_eq!(entries, [data.clone(), data2.clone()]);
 
         let entries = store
             .get(descriptor, TestDataQuery::default().id(128))
-            .await
             .unwrap();
         assert_eq!(entries, [data2]);
 
@@ -474,27 +623,25 @@ mod tests {
                 descriptor,
                 TestDataQuery::default().name("Hello World".into()),
             )
-            .await
             .unwrap();
 
         let entry = store
             .get_one(descriptor, TestDataQuery::default().id(0))
-            .await
             .unwrap();
         assert_eq!(entry, Some(data));
     }
 
     #[tokio::test]
     async fn test_store_collision() {
-        let store = MemStore::connect("").await.unwrap();
+        let store = MemStore::new();
 
         let data = TestData::default();
         let descriptor = <TestData as StoreData<_>>::Descriptor::default();
 
-        store.insert(descriptor, data).await.unwrap();
+        store.insert(descriptor, data).unwrap();
 
         let data = Collide::default();
         let descriptor = <Collide as StoreData<_>>::Descriptor::default();
-        store.insert(descriptor, data).await.unwrap_err();
+        store.insert(descriptor, data).unwrap_err();
     }
 }
