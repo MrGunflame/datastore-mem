@@ -10,7 +10,7 @@
 //! use datastore::{Store, StoreExt, StoreData};
 //! use datastore_mem::{Error, MemStore};
 //!
-//! #[derive(Debug, PartialEq, StoreData)]
+//! #[derive(Clone, Debug, PartialEq, StoreData)]
 //! struct Person {
 //!     id: i64,
 //!     name: String,
@@ -25,9 +25,9 @@
 //!         name: String::from("Robb"),
 //!     };
 //!
-//!     store.insert(store.descriptor::<Person>(), person.clone()).await?;
+//!     Store::insert(&store, store.descriptor::<Person>(), person.clone()).await?;
 //!
-//!     let persons: Vec<Person> = store.get_all(store.descriptor::<Person>()).await?;
+//!     let persons: Vec<Person> = Store::get_all(&store, store.descriptor::<Person>()).await?;
 //!     assert_eq!(persons, [person]);
 //!
 //!     Ok(())
@@ -45,7 +45,7 @@
 //! use datastore::{Store, StoreExt, StoreData};
 //! use datastore_mem::{Error, MemStore};
 //!
-//! #[derive(Debug, PartialEq, StoreData)]
+//! #[derive(Clone, Debug, PartialEq, StoreData)]
 //! struct Person {
 //!     id: i64,
 //!     name: String,
@@ -77,6 +77,8 @@
 //! - `f32`, `f64`
 //! - `&str`, `String`
 //! - `&[u8]`, `Vec<u8>`
+//!
+//! [`Store`]: datastore::Store
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod entries;
@@ -346,7 +348,7 @@ unsafe impl Sync for Inner {}
 
 /// Types of supported types.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum DataKind {
+enum DataKind {
     Bool,
     I8,
     I16,
@@ -435,12 +437,23 @@ impl Display for DataKind {
     }
 }
 
-#[derive(Clone, Debug, Error)]
-pub enum Error {
-    #[error("unknown key: {0}")]
-    UnknownKey(String),
-    #[error("invalid type: expected {expected}, found {found}")]
-    InvalidType { expected: DataKind, found: DataKind },
+/// An error that can occur when using [`MemStore`].
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error(transparent)]
+pub struct Error(#[from] ErrorKind);
+
+impl Error {
+    /// Returns `true` if this error was created with [`Error::custom`].
+    ///
+    /// [`Error::custom`]: datastore::Error::custom
+    #[inline]
+    pub fn is_custom(&self) -> bool {
+        matches!(self.0, ErrorKind::Custom(_))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+enum ErrorKind {
     #[error("{0}")]
     Custom(String),
     #[error("missmatching schema")]
@@ -452,7 +465,7 @@ impl datastore::Error for Error {
     where
         T: ToString,
     {
-        Self::Custom(msg.to_string())
+        Self(ErrorKind::Custom(msg.to_string()))
     }
 }
 

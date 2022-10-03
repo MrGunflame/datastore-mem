@@ -6,6 +6,7 @@ use datastore::{DataDescriptor, DataQuery, StoreData};
 use crate::reader::MemReader;
 use crate::utils::unwrap_infallible;
 use crate::writer::MemWriter;
+use crate::ErrorKind;
 use crate::{schema::Schema, Error, MemStore};
 
 #[derive(Debug)]
@@ -29,7 +30,7 @@ impl Entries {
         D: DataDescriptor<T, MemStore>,
     {
         if !self.schema.eq(&descriptor) {
-            return Err(Error::MissmatchingSchema);
+            return Err(ErrorKind::MissmatchingSchema.into());
         }
 
         unsafe { Ok(self.read_all_unchecked()) }
@@ -41,7 +42,7 @@ impl Entries {
         D: DataDescriptor<T, MemStore>,
     {
         if !self.schema.eq(&descriptor) {
-            return Err(Error::MissmatchingSchema);
+            return Err(ErrorKind::MissmatchingSchema.into());
         }
 
         // SAFETY: Schemas are matching.
@@ -56,7 +57,7 @@ impl Entries {
         Q: DataQuery<T, MemStore>,
     {
         if !self.schema.eq(&descriptor) {
-            return Err(Error::MissmatchingSchema);
+            return Err(ErrorKind::MissmatchingSchema.into());
         }
 
         unsafe { Ok(self.filter_unchecked(query)) }
@@ -69,7 +70,7 @@ impl Entries {
         Q: DataQuery<T, MemStore>,
     {
         if !self.schema.eq(&descriptor) {
-            return Err(Error::MissmatchingSchema);
+            return Err(ErrorKind::MissmatchingSchema.into());
         }
 
         unsafe { self.retain_unchecked(query) };
