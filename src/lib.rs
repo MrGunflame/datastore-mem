@@ -1,13 +1,23 @@
+mod entries;
+mod reader;
+mod schema;
+mod types;
+mod utils;
+mod writer;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{self, Display, Formatter};
+use std::mem;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datastore::{
     DataDescriptor, DataQuery, Read, Reader, Store, StoreData, TypeWriter, Write, Writer,
 };
+use entries::Entries;
 use parking_lot::RwLock;
+use schema::Schema;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -42,7 +52,7 @@ impl Store for MemStore {
         D: DataDescriptor<T, Self> + Send,
         Q: DataQuery<T, Self> + Send,
     {
-        unimplemented!()
+        self.inner.delete(descriptor, query)
     }
 
     async fn get<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Vec<T>, Self::Error>
@@ -51,7 +61,7 @@ impl Store for MemStore {
         D: DataDescriptor<T, Self> + Send,
         Q: DataQuery<T, Self> + Send,
     {
-        unimplemented!()
+        self.inner.get(descriptor, query)
     }
 
     async fn get_all<T, D>(&self, descriptor: D) -> Result<Vec<T>, Self::Error>
@@ -59,21 +69,7 @@ impl Store for MemStore {
         T: StoreData<Self> + Send + Sync + 'static,
         D: DataDescriptor<T, Self> + Send,
     {
-        let inner = self.inner.map.read();
-
-        match inner.get(descriptor.ident()) {
-            Some(entries) => {
-                let mut buf = Vec::with_capacity(entries.len());
-
-                for entry in entries {
-                    let mut reader = MemReader::new(entry);
-                    buf.push(T::read(&mut reader)?);
-                }
-
-                Ok(buf)
-            }
-            None => Ok(Vec::new()),
-        }
+        self.inner.get_all(descriptor)
     }
 
     async fn get_one<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Option<T>, Self::Error>
@@ -82,21 +78,7 @@ impl Store for MemStore {
         D: DataDescriptor<T, Self> + Send,
         Q: DataQuery<T, Self> + Send,
     {
-        let inner = self.inner.map.read();
-
-        match inner.get(descriptor.ident()) {
-            Some(entries) => {
-                let mut writer = MemWriter::new();
-                query.write(&mut writer);
-
-                for entry in entries {
-                    let mut reader = MemReader::new(entry);
-                }
-
-                Ok(Some(x))
-            }
-            None => Ok(None),
-        }
+        self.inner.get_one(descriptor, query)
     }
 
     async fn insert<T, D>(&self, descriptor: D, data: T) -> Result<(), Self::Error>
@@ -104,30 +86,108 @@ impl Store for MemStore {
         T: StoreData<Self> + Send + Sync + 'static,
         D: DataDescriptor<T, Self> + Send,
     {
-        let mut writer = MemWriter::new();
-
-        // MemWriter::Error is Infallible
-        let _ = data.write(&mut writer);
-
-        self.inner.insert(descriptor.ident(), writer.into_entry());
-        Ok(())
+        self.inner.insert(descriptor, data)
     }
 }
 
 #[derive(Debug)]
 struct Inner {
-    map: RwLock<HashMap<String, Vec<Entry>>>,
+    map: RwLock<HashMap<String, Entries>>,
 }
 
 impl Inner {
-    fn insert(&self, name: &str, entry: Entry) {
+    fn insert<T, D>(&self, descriptor: D, data: T) -> Result<(), Error>
+    where
+        T: StoreData<MemStore>,
+        D: DataDescriptor<T, MemStore>,
+    {
         let mut inner = self.map.write();
 
-        match inner.get_mut(name) {
-            Some(entries) => entries.push(entry),
+        match inner.get_mut(descriptor.ident()) {
+            Some(entries) => entries.insert(descriptor, data),
+            // Initialize the schema.
             None => {
-                inner.insert(name.to_string(), vec![entry]);
+                let schema = Schema::from_descriptor(&descriptor);
+                let mut entries = Entries::new(schema);
+
+                // SAFETY: We used `T` to create the schema, so the newly created `Entries`
+                // is always valid for `T`.
+                unsafe {
+                    entries.insert_unchecked(data);
+                }
+
+                inner.insert(descriptor.ident().to_owned(), entries);
+                Ok(())
             }
+        }
+    }
+
+    fn delete<T, D, Q>(&self, descriptor: D, query: Q) -> Result<(), Error>
+    where
+        T: StoreData<MemStore>,
+        D: DataDescriptor<T, MemStore>,
+        Q: DataQuery<T, MemStore>,
+    {
+        let mut inner = self.map.write();
+
+        match inner.get_mut(descriptor.ident()) {
+            Some(entries) => entries.retain(descriptor, query),
+            None => Ok(()),
+        }
+    }
+
+    fn get<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Vec<T>, Error>
+    where
+        T: StoreData<MemStore>,
+        D: DataDescriptor<T, MemStore>,
+        Q: DataQuery<T, MemStore>,
+    {
+        let inner = self.map.read();
+
+        match inner.get(descriptor.ident()) {
+            Some(entries) => {
+                Ok(entries
+                    .filter(descriptor, query)?
+                    .map(|entry| {
+                        // SAFETY: The call to `filter` already validates the schema.
+                        unsafe { entry.read_unchecked() }
+                    })
+                    .collect())
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn get_all<T, D>(&self, descriptor: D) -> Result<Vec<T>, Error>
+    where
+        T: StoreData<MemStore>,
+        D: DataDescriptor<T, MemStore>,
+    {
+        let inner = self.map.read();
+
+        match inner.get(descriptor.ident()) {
+            Some(entries) => entries.read_all(descriptor),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn get_one<T, D, Q>(&self, descriptor: D, query: Q) -> Result<Option<T>, Error>
+    where
+        T: StoreData<MemStore>,
+        D: DataDescriptor<T, MemStore>,
+        Q: DataQuery<T, MemStore>,
+    {
+        let inner = self.map.read();
+
+        match inner.get(descriptor.ident()) {
+            Some(entries) => Ok(entries
+                .filter(descriptor, query)?
+                .map(|entry| {
+                    // SAFETY: The call to `filter` already validates the schema.
+                    unsafe { entry.read_unchecked() }
+                })
+                .next()),
+            None => Ok(None),
         }
     }
 }
@@ -135,6 +195,7 @@ impl Inner {
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
+/// A single entry of a specific type.
 #[derive(Debug)]
 struct Entry {
     buf: Vec<u8>,
@@ -158,43 +219,77 @@ impl Entry {
             None => Err(Error::UnknownKey(key.to_string())),
         }
     }
-    
-    fn eq(&self, key: &str, kind: DataKind, other: &[u8]) -> Result<bool, Error> {
+
+    /// Returns the buffer starting at field `key` without checking if the key exists.
+    ///
+    /// # Safety
+    ///
+    /// Calling this method with a `key` value that is not in `self.fields` is undefined behavoir.
+    unsafe fn read_field_unchecked(&self, key: &str) -> &[u8] {
+        let (_, index) = self.fields.get(key).unwrap();
+
+        // SAFETY: The caller guarantees that is within bounds.
+        unsafe { self.buf.get_unchecked(*index..) }
+    }
+
+    /// Compares the value of `key` with other only if the value is `kind`. The caller guarantees
+    /// that `other` is `kind`.
+    fn field_eq(&self, key: &str, kind: DataKind, other: &[u8]) -> Result<bool, Error> {
         let buf = self.read_field(key, kind)?;
 
-        let res = match kind {
-            DataKind::Bool | DataKind::I8 | DataKind::U8 => {
-                unsafe {
-                    buf.get_unchecked(0) == other.get_unchecked(0)
-                }
-            }
-            DataKind::I16 | DataKind::U16 => {
-                unsafe {
-                    buf.get_unchecked(0..2) == other.get_unchecked(0..2)
-                }
-            }
-            DataKind::I32 | DataKind::U32 | DataKind::F32 => {
-                unsafe {
-                    buf.get_unchecked(0..4) == other.get_unchecked(0..4)
-                }
-            }
-            DataKind::I64 | DataKind::U64 | DataKind::F64 => {
-                unsafe {
-                    buf.get_unchecked(0..8) == other.get_unchecked(0..8)
-                }
-            }
-            DataKind::Bytes | DataKind::String => {
-                let ptr = buf.as_ptr() as *const usize;
-                let len : usize = unsafe { std::ptr::read_unaligned(ptr) };
+        unsafe { Ok(kind.read_unchecked(buf) == other) }
 
-                let bytes = unsafe { buf.get_unchecked(..std::mem::size_of::<usize>() + len) };
+        // let res = match kind {
+        //     DataKind::Bool | DataKind::I8 | DataKind::U8 => unsafe {
+        //         buf.get_unchecked(0) == other.get_unchecked(0)
+        //     },
+        //     DataKind::I16 | DataKind::U16 => unsafe {
+        //         buf.get_unchecked(0..2) == other.get_unchecked(0..2)
+        //     },
+        //     DataKind::I32 | DataKind::U32 | DataKind::F32 => unsafe {
+        //         buf.get_unchecked(0..4) == other.get_unchecked(0..4)
+        //     },
+        //     DataKind::I64 | DataKind::U64 | DataKind::F64 => unsafe {
+        //         buf.get_unchecked(0..8) == other.get_unchecked(0..8)
+        //     },
+        //     DataKind::Bytes | DataKind::String => {
+        //         let ptr = buf.as_ptr() as *const usize;
+        //         let len: usize = unsafe { std::ptr::read_unaligned(ptr) };
 
-                bytes == other
-            }
-        };
+        //         let bytes = unsafe { buf.get_unchecked(..std::mem::size_of::<usize>() + len) };
 
-        Ok(res)
+        //         bytes == other
+        //     }
+        // };
+
+        // Ok(res)
     }
+
+    /// Compares if `other` equals `self`. This means that all fields on `other` exist on `self`.
+    /// It does not mean that all fields on `self` exist on `other`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error::InvalidType`] when a field in `self` has a different type than the
+    /// field in `other` with the same key.
+    fn eq(&self, other: &Entry) -> Result<bool, Error> {
+        for (key, (kind, _)) in &other.fields {
+            // SAFETY: The key exists in the entry.
+            let other = unsafe { other.read_field_unchecked(key) };
+
+            if !self.field_eq(key, *kind, other)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    // fn fields_iter(&self) -> impl Iterator<Item = (DataKind, &[u8])> {
+    //     self.fields
+    //         .values()
+    //         .map(|(kind, index)| self.read_field(x, kind))
+    // }
 }
 
 /// Types of supported types.
@@ -213,6 +308,59 @@ pub enum DataKind {
     F64,
     Bytes,
     String,
+}
+
+impl DataKind {
+    /// Reads the buffer of the value of `self` from `buf` without checking if the buffer is big
+    /// enough.
+    ///
+    /// # Safety
+    ///
+    /// Calling this method with a buffer that is not big enough to hold `self` causes undefined
+    /// behavoir.
+    unsafe fn read_unchecked<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        match self {
+            Self::Bool | Self::I8 | Self::U8 => {
+                #[cfg(debug_assertions)]
+                let _ = &buf[..1];
+
+                // SAFETY: The caller guarantees that the buffer is big enough.
+                unsafe { buf.get_unchecked(..1) }
+            }
+            Self::I16 | Self::U16 => {
+                #[cfg(debug_assertions)]
+                let _ = &buf[..2];
+
+                // SAFETY: The caller guarantees that the buffer is big enough.
+                unsafe { buf.get_unchecked(..2) }
+            }
+            Self::I32 | Self::U32 | Self::F32 => {
+                #[cfg(debug_assertions)]
+                let _ = &buf[..4];
+
+                // SAFETY: The caller guarantees that the buffer is big enough.
+                unsafe { buf.get_unchecked(..4) }
+            }
+            Self::I64 | Self::U64 | Self::F64 => {
+                #[cfg(debug_assertions)]
+                let _ = &buf[..8];
+
+                // SAFETY: The caller guarantees that the buffer is big enough.
+                unsafe { buf.get_unchecked(..8) }
+            }
+            Self::Bytes | Self::String => {
+                #[cfg(debug_assertions)]
+                let _ = &buf[..std::mem::size_of::<usize>()];
+
+                // Read the length from the buffer.
+                let len = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const usize) };
+
+                // Read the complete buffer including length.
+                // SAFETY: The caller guarantees that the buffer is big enough.
+                unsafe { buf.get_unchecked(..len) }
+            }
+        }
+    }
 }
 
 impl Display for DataKind {
@@ -243,6 +391,8 @@ pub enum Error {
     InvalidType { expected: DataKind, found: DataKind },
     #[error("{0}")]
     Custom(String),
+    #[error("missmatching schema")]
+    MissmatchingSchema,
 }
 
 impl datastore::Error for Error {
@@ -455,10 +605,15 @@ impl<'a> MemReader<'a> {
         Self { entry, key: "" }
     }
 
+    /// Tries to read the buffer of the value of `key` only if it has type
+    /// `kind`. Returns an [`Error`] if the type doesn't match.
+    #[inline]
     fn read(&self, key: &str, kind: DataKind) -> Result<&[u8], Error> {
         self.entry.read_field(key, kind)
     }
 
+    /// Tries to read `T` of the `key` only if it has type `kind` by copying the buffer read
+    /// by [`read_copy`].
     fn read_copy<T>(&self, key: &str, kind: DataKind) -> Result<T, Error> {
         let buf = self.read(key, kind)?;
 
@@ -544,5 +699,104 @@ impl<'a> Reader<MemStore> for MemReader<'a> {
     {
         self.key = key;
         T::read(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datastore::{Store, StoreData};
+
+    use crate::DataKind;
+
+    use super::MemStore;
+
+    #[test]
+    fn test_data_kind_read_unchecked() {
+        let buf = [0, 1, 2, 3, 4, 5, 6, 7];
+
+        unsafe {
+            assert_eq!(DataKind::Bool.read_unchecked(&buf), [0]);
+            assert_eq!(DataKind::I8.read_unchecked(&buf), [0]);
+            assert_eq!(DataKind::U8.read_unchecked(&buf), [0]);
+
+            assert_eq!(DataKind::I16.read_unchecked(&buf), [0, 1]);
+            assert_eq!(DataKind::U16.read_unchecked(&buf), [0, 1]);
+
+            assert_eq!(DataKind::I32.read_unchecked(&buf), [0, 1, 2, 3]);
+            assert_eq!(DataKind::U32.read_unchecked(&buf), [0, 1, 2, 3]);
+
+            assert_eq!(DataKind::I64.read_unchecked(&buf), [0, 1, 2, 3, 4, 5, 6, 7]);
+            assert_eq!(DataKind::U64.read_unchecked(&buf), [0, 1, 2, 3, 4, 5, 6, 7]);
+        }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, StoreData)]
+    #[datastore(name = "test")]
+    struct TestData {
+        id: u8,
+        name: String,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, StoreData)]
+    #[datastore(name = "test")]
+    struct Collide {
+        x: u8,
+    }
+
+    #[tokio::test]
+    async fn test_store() {
+        let store = MemStore::connect("").await.unwrap();
+
+        let data = TestData::default();
+        let descriptor = <TestData as StoreData<_>>::Descriptor::default();
+
+        store.insert(descriptor, data.clone()).await.unwrap();
+
+        let entries = store.get_all(descriptor).await.unwrap();
+        assert_eq!(entries, [data.clone()]);
+
+        let data2 = TestData {
+            id: 128,
+            name: "Hello World".into(),
+        };
+
+        store.insert(descriptor, data2.clone()).await.unwrap();
+
+        let entries = store.get_all(descriptor).await.unwrap();
+        assert_eq!(entries, [data.clone(), data2.clone()]);
+
+        let entries = store
+            .get(descriptor, TestDataQuery::default().id(128))
+            .await
+            .unwrap();
+        assert_eq!(entries, [data2]);
+
+        store
+            .delete(
+                descriptor,
+                TestDataQuery::default().name("Hello World".into()),
+            )
+            .await
+            .unwrap();
+
+        let entry = store
+            .get_one(descriptor, TestDataQuery::default().id(0))
+            .await
+            .unwrap();
+        assert_eq!(entry, Some(data));
+    }
+
+    #[tokio::test]
+    async fn test_store_collision() {
+        let store = MemStore::connect("").await.unwrap();
+
+        let data = TestData::default();
+        let descriptor = <TestData as StoreData<_>>::Descriptor::default();
+
+        store.insert(descriptor, data).await.unwrap();
+
+        let data = Collide::default();
+        let descriptor = <Collide as StoreData<_>>::Descriptor::default();
+        store.insert(descriptor, data).await.unwrap_err();
     }
 }
