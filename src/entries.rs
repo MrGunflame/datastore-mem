@@ -140,8 +140,8 @@ impl Entries {
         dbg!(&filter);
 
         self.entries.retain(|entry| {
-            dbg!(entry);
-            !entry.filter_unchecked(&self.schema, &filter)
+            // SAFETY: The caller guarantees that the schema matches.
+            unsafe { !entry.filter_unchecked(&self.schema, &filter) }
         });
     }
 }
@@ -183,10 +183,13 @@ impl Entry {
                     // Get the type of `key` from the schema.
                     let kind = schema.fields.get(key).unwrap();
 
-                    if kind.read_unchecked(self.read_field(key).unwrap())
-                        != kind.read_unchecked(filter.read_field(key).unwrap())
-                    {
-                        return false;
+                    // SAFETY: The caller guarantees that the schema matches.
+                    unsafe {
+                        if kind.read_unchecked(self.read_field(key).unwrap())
+                            != kind.read_unchecked(filter.read_field(key).unwrap())
+                        {
+                            return false;
+                        }
                     }
                 }
                 None => return false,

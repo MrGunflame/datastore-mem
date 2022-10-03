@@ -1,10 +1,9 @@
+use std::convert::Infallible;
 use std::mem;
-use std::{collections::HashMap, convert::Infallible};
 
 use datastore::{Read, Reader};
 
-use crate::entries::Entry;
-use crate::{DataKind, Error, MemStore};
+use crate::MemStore;
 
 pub struct MemReader<'a> {
     buf: &'a [u8],

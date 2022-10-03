@@ -1,3 +1,5 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
 mod entries;
 mod reader;
 mod schema;
@@ -8,13 +10,10 @@ mod writer;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{self, Display, Formatter};
-use std::mem;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datastore::{
-    DataDescriptor, DataQuery, Read, Reader, Store, StoreData, TypeWriter, Write, Writer,
-};
+use datastore::{DataDescriptor, DataQuery, Store, StoreData, TypeWriter, Write};
 use entries::Entries;
 use parking_lot::RwLock;
 use schema::Schema;
@@ -195,103 +194,6 @@ impl Inner {
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
-/// A single entry of a specific type.
-#[derive(Debug)]
-struct Entry {
-    buf: Vec<u8>,
-    fields: HashMap<String, (DataKind, usize)>,
-}
-
-impl Entry {
-    fn read_field(&self, key: &str, kind: DataKind) -> Result<&[u8], Error> {
-        match self.fields.get(key) {
-            Some((k, index)) => {
-                if *k != kind {
-                    Err(Error::InvalidType {
-                        expected: kind,
-                        found: *k,
-                    })
-                } else {
-                    // SAFETY: The index is guaranteed to be within bounds.
-                    unsafe { Ok(self.buf.get_unchecked(*index..)) }
-                }
-            }
-            None => Err(Error::UnknownKey(key.to_string())),
-        }
-    }
-
-    /// Returns the buffer starting at field `key` without checking if the key exists.
-    ///
-    /// # Safety
-    ///
-    /// Calling this method with a `key` value that is not in `self.fields` is undefined behavoir.
-    unsafe fn read_field_unchecked(&self, key: &str) -> &[u8] {
-        let (_, index) = self.fields.get(key).unwrap();
-
-        // SAFETY: The caller guarantees that is within bounds.
-        unsafe { self.buf.get_unchecked(*index..) }
-    }
-
-    /// Compares the value of `key` with other only if the value is `kind`. The caller guarantees
-    /// that `other` is `kind`.
-    fn field_eq(&self, key: &str, kind: DataKind, other: &[u8]) -> Result<bool, Error> {
-        let buf = self.read_field(key, kind)?;
-
-        unsafe { Ok(kind.read_unchecked(buf) == other) }
-
-        // let res = match kind {
-        //     DataKind::Bool | DataKind::I8 | DataKind::U8 => unsafe {
-        //         buf.get_unchecked(0) == other.get_unchecked(0)
-        //     },
-        //     DataKind::I16 | DataKind::U16 => unsafe {
-        //         buf.get_unchecked(0..2) == other.get_unchecked(0..2)
-        //     },
-        //     DataKind::I32 | DataKind::U32 | DataKind::F32 => unsafe {
-        //         buf.get_unchecked(0..4) == other.get_unchecked(0..4)
-        //     },
-        //     DataKind::I64 | DataKind::U64 | DataKind::F64 => unsafe {
-        //         buf.get_unchecked(0..8) == other.get_unchecked(0..8)
-        //     },
-        //     DataKind::Bytes | DataKind::String => {
-        //         let ptr = buf.as_ptr() as *const usize;
-        //         let len: usize = unsafe { std::ptr::read_unaligned(ptr) };
-
-        //         let bytes = unsafe { buf.get_unchecked(..std::mem::size_of::<usize>() + len) };
-
-        //         bytes == other
-        //     }
-        // };
-
-        // Ok(res)
-    }
-
-    /// Compares if `other` equals `self`. This means that all fields on `other` exist on `self`.
-    /// It does not mean that all fields on `self` exist on `other`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`Error::InvalidType`] when a field in `self` has a different type than the
-    /// field in `other` with the same key.
-    fn eq(&self, other: &Entry) -> Result<bool, Error> {
-        for (key, (kind, _)) in &other.fields {
-            // SAFETY: The key exists in the entry.
-            let other = unsafe { other.read_field_unchecked(key) };
-
-            if !self.field_eq(key, *kind, other)? {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    // fn fields_iter(&self) -> impl Iterator<Item = (DataKind, &[u8])> {
-    //     self.fields
-    //         .values()
-    //         .map(|(kind, index)| self.read_field(x, kind))
-    // }
-}
-
 /// Types of supported types.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DataKind {
@@ -405,102 +307,6 @@ impl datastore::Error for Error {
 }
 
 #[derive(Debug)]
-struct MemWriter {
-    buf: Vec<u8>,
-    fields: HashMap<String, (DataKind, usize)>,
-    kind: DataKind,
-}
-
-impl MemWriter {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            fields: HashMap::new(),
-            kind: DataKind::Bool,
-        }
-    }
-
-    fn write(&mut self, buf: &[u8], kind: DataKind) -> Result<(), Infallible> {
-        self.buf.extend(buf);
-        self.kind = kind;
-        Ok(())
-    }
-
-    fn into_entry(self) -> Entry {
-        Entry {
-            buf: self.buf,
-            fields: self.fields,
-        }
-    }
-}
-
-impl Writer<MemStore> for MemWriter {
-    type Error = Infallible;
-
-    fn write_bool(&mut self, v: bool) -> Result<(), Self::Error> {
-        self.write(&[v as u8], DataKind::Bool)
-    }
-
-    fn write_i8(&mut self, v: i8) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::I8)
-    }
-
-    fn write_i16(&mut self, v: i16) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::I16)
-    }
-
-    fn write_i32(&mut self, v: i32) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::I32)
-    }
-
-    fn write_i64(&mut self, v: i64) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::I64)
-    }
-
-    fn write_u8(&mut self, v: u8) -> Result<(), Self::Error> {
-        self.write(&[v], DataKind::U8)
-    }
-
-    fn write_u16(&mut self, v: u16) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::U16)
-    }
-
-    fn write_u32(&mut self, v: u32) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::U32)
-    }
-
-    fn write_u64(&mut self, v: u64) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::U64)
-    }
-
-    fn write_f32(&mut self, v: f32) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::F32)
-    }
-
-    fn write_f64(&mut self, v: f64) -> Result<(), Self::Error> {
-        self.write(&v.to_ne_bytes(), DataKind::F64)
-    }
-
-    fn write_bytes(&mut self, v: &[u8]) -> Result<(), Self::Error> {
-        self.write(v, DataKind::Bytes)
-    }
-
-    fn write_str(&mut self, v: &str) -> Result<(), Self::Error> {
-        self.write(v.as_bytes(), DataKind::String)
-    }
-
-    fn write_field<T>(&mut self, key: &'static str, value: &T) -> Result<(), Self::Error>
-    where
-        T: ?Sized + Write<MemStore>,
-    {
-        let index = self.buf.len();
-        value.write(self)?;
-        self.fields.insert(key.to_string(), (self.kind, index));
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
 struct MemTypeWriter {
     values: Vec<(String, DataKind)>,
     kind: DataKind,
@@ -591,114 +397,6 @@ impl TypeWriter<MemStore> for MemTypeWriter {
 
         self.values.push((key.to_string(), self.kind));
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct MemReader<'a> {
-    entry: &'a Entry,
-    key: &'static str,
-}
-
-impl<'a> MemReader<'a> {
-    fn new(entry: &'a Entry) -> Self {
-        Self { entry, key: "" }
-    }
-
-    /// Tries to read the buffer of the value of `key` only if it has type
-    /// `kind`. Returns an [`Error`] if the type doesn't match.
-    #[inline]
-    fn read(&self, key: &str, kind: DataKind) -> Result<&[u8], Error> {
-        self.entry.read_field(key, kind)
-    }
-
-    /// Tries to read `T` of the `key` only if it has type `kind` by copying the buffer read
-    /// by [`read_copy`].
-    fn read_copy<T>(&self, key: &str, kind: DataKind) -> Result<T, Error> {
-        let buf = self.read(key, kind)?;
-
-        let ptr = buf.as_ptr() as *const T;
-
-        unsafe { Ok(std::ptr::read_unaligned(ptr)) }
-    }
-}
-
-impl<'a> Reader<MemStore> for MemReader<'a> {
-    type Error = Error;
-
-    fn read_bool(&mut self) -> Result<bool, Self::Error> {
-        self.read_copy(self.key, DataKind::Bool)
-    }
-
-    fn read_i8(&mut self) -> Result<i8, Self::Error> {
-        self.read_copy(self.key, DataKind::I8)
-    }
-
-    fn read_i16(&mut self) -> Result<i16, Self::Error> {
-        self.read_copy(self.key, DataKind::I16)
-    }
-
-    fn read_i32(&mut self) -> Result<i32, Self::Error> {
-        self.read_copy(self.key, DataKind::I32)
-    }
-
-    fn read_i64(&mut self) -> Result<i64, Self::Error> {
-        self.read_copy(self.key, DataKind::I64)
-    }
-
-    fn read_u8(&mut self) -> Result<u8, Self::Error> {
-        self.read_copy(self.key, DataKind::U8)
-    }
-
-    fn read_u16(&mut self) -> Result<u16, Self::Error> {
-        self.read_copy(self.key, DataKind::U16)
-    }
-
-    fn read_u32(&mut self) -> Result<u32, Self::Error> {
-        self.read_copy(self.key, DataKind::U32)
-    }
-
-    fn read_u64(&mut self) -> Result<u64, Self::Error> {
-        self.read_copy(self.key, DataKind::U64)
-    }
-
-    fn read_f32(&mut self) -> Result<f32, Self::Error> {
-        self.read_copy(self.key, DataKind::F32)
-    }
-
-    fn read_f64(&mut self) -> Result<f64, Self::Error> {
-        self.read_copy(self.key, DataKind::F64)
-    }
-
-    fn read_byte_buf(&mut self) -> Result<Vec<u8>, Self::Error> {
-        let buf = self.read(self.key, DataKind::Bytes)?;
-
-        let ptr = buf.as_ptr() as *const usize;
-        let len = unsafe { std::ptr::read_unaligned(ptr) };
-
-        let mut bytes = Vec::with_capacity(len);
-
-        let content = unsafe { buf.as_ptr().add(std::mem::size_of::<usize>()) };
-
-        unsafe {
-            std::ptr::copy(content, bytes.as_mut_ptr(), len);
-        }
-
-        Ok(bytes)
-    }
-
-    fn read_string(&mut self) -> Result<String, Self::Error> {
-        let buf = self.read_byte_buf()?;
-
-        unsafe { Ok(String::from_utf8_unchecked(buf)) }
-    }
-
-    fn read_field<T>(&mut self, key: &'static str) -> Result<T, Self::Error>
-    where
-        T: ?Sized + Read<MemStore>,
-    {
-        self.key = key;
-        T::read(self)
     }
 }
 
